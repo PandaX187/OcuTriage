@@ -49,25 +49,80 @@ def calculate_quality_metrics(img_pil):
 
 
 def preprocess_for_model(img_pil):
-    """
-    Match training notebook behavior:
-    - resize to 224x224
-    - convert to array
-    - DO NOT divide by 255
-    """
     img_resized = img_pil.resize(IMG_SIZE)
     img_tensor = tf.keras.utils.img_to_array(img_resized)
     img_tensor = np.expand_dims(img_tensor, axis=0).astype(np.float32)
     return img_resized, img_tensor
 
 
+def is_likely_retina_scan(img_pil):
+    """
+    Heuristic validation for retinal fundus images.
+    This blocks obviously unrelated images like documents/screenshots/resumes.
+    """
+    img = np.array(img_pil)
+    if img.ndim != 3 or img.shape[2] != 3:
+        return False, "Input Error: Please upload a retinal fundus image only."
+
+    h, w, _ = img.shape
+    if h < 150 or w < 150:
+        return False, "Input Error: Image is too small. Please upload a retinal fundus image."
+
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    # --- 1. Detect large dark border around fundus-like circle ---
+    dark_ratio = np.mean(gray < 25)
+
+    # --- 2. Detect warm retinal colors (orange/red/yellow-ish) ---
+    # Fundus images usually have significant warm tones in HSV.
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    warm_mask = (
+        (((hue >= 5) & (hue <= 35)) | ((hue >= 160) & (hue <= 179))) &
+        (sat > 40) &
+        (val > 40)
+    )
+    warm_ratio = np.mean(warm_mask)
+
+    # --- 3. Circular central structure check using Hough circles ---
+    blurred = cv2.medianBlur(gray, 7)
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=min(h, w) // 2,
+        param1=80,
+        param2=30,
+        minRadius=min(h, w) // 5,
+        maxRadius=min(h, w) // 2,
+    )
+
+    has_circle = circles is not None
+
+    # Relaxed but practical rule:
+    # retina images often satisfy at least 2 of the 3 checks
+    score = 0
+    if dark_ratio > 0.15:
+        score += 1
+    if warm_ratio > 0.20:
+        score += 1
+    if has_circle:
+        score += 1
+
+    if score < 2:
+        return False, "Input Error: Please upload a valid retinal fundus image only."
+
+    return True, None
+
+
 def generate_clinical_gradcam(img_tensor, model):
     """
-    Grad-CAM implementation based directly on the training notebook logic.
-    This avoids rebuilding a separate graph model and instead uses:
-    - feature extractor = efficientnetb0
-    - classifier head = remaining sequential layers
-    - logits = manual dense computation (pre-softmax)
+    Grad-CAM implementation based on the training notebook structure:
+    Sequential([EfficientNetB0, GAP, BN, Dropout, Dense])
     """
     feature_extractor = model.get_layer("efficientnetb0")
     classifier_layers = model.layers[1:]
@@ -78,11 +133,9 @@ def generate_clinical_gradcam(img_tensor, model):
 
         x = feature_maps
 
-        # Run through GAP -> BatchNorm -> Dropout
         for layer in classifier_layers[:-1]:
             x = layer(x, training=False)
 
-        # Final Dense layer, but use raw logits before softmax
         final_dense = classifier_layers[-1]
         logits = tf.matmul(x, final_dense.kernel) + final_dense.bias
 
@@ -105,15 +158,8 @@ def generate_clinical_gradcam(img_tensor, model):
 
 
 def create_gradcam_overlay(original_pil, heatmap, alpha=0.4):
-    """
-    Create a nicer returned visualization:
-    - preserve aspect ratio for display
-    - resize heatmap to display size
-    - overlay colored map on original
-    - encode as PNG for better quality
-    """
     display_img = original_pil.copy()
-    display_img.thumbnail((900, 900))  # keeps aspect ratio
+    display_img.thumbnail((900, 900))
 
     display_rgb = np.array(display_img)
     h, w = display_rgb.shape[:2]
@@ -121,18 +167,15 @@ def create_gradcam_overlay(original_pil, heatmap, alpha=0.4):
     heatmap_resized = cv2.resize(heatmap, (w, h))
     heatmap_uint8 = np.uint8(255 * heatmap_resized)
 
-    # JET color map like notebook
     jet = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
     jet_rgb = cv2.cvtColor(jet, cv2.COLOR_BGR2RGB)
 
-    # Normalize original for blending
     original_float = display_rgb.astype("float32") / 255.0
     jet_float = jet_rgb.astype("float32") / 255.0
 
     superimposed = jet_float * alpha + original_float
     superimposed = np.clip(superimposed, 0, 1)
 
-    # Back to BGR for OpenCV encoding
     superimposed_uint8 = np.uint8(superimposed * 255)
     superimposed_bgr = cv2.cvtColor(superimposed_uint8, cv2.COLOR_RGB2BGR)
     return superimposed_bgr
@@ -143,6 +186,18 @@ def encode_bgr_to_base64_png(img_bgr):
     if not ok:
         raise ValueError("Failed to encode image.")
     return base64.b64encode(buffer).decode("utf-8")
+
+
+def confidence_label_from_prob(confidence):
+    """
+    Cleaner confidence interpretation.
+    This is still NOT true calibration, but better UI wording.
+    """
+    if confidence >= 90:
+        return "High confidence"
+    if confidence >= 75:
+        return "Moderate confidence"
+    return "Low confidence"
 
 
 # =========================
@@ -162,7 +217,15 @@ async def predict(file: UploadFile = File(...)):
         request_object_content = await file.read()
         img_raw = Image.open(io.BytesIO(request_object_content)).convert("RGB")
 
-        # --- IMAGE QUALITY ASSESSMENT (IQA) ---
+        # --- RETINA VALIDATION ---
+        is_retina, retina_error = is_likely_retina_scan(img_raw)
+        if not is_retina:
+            return JSONResponse(
+                status_code=400,
+                content={"message": retina_error}
+            )
+
+        # --- IMAGE QUALITY ASSESSMENT ---
         sharpness_score, brightness_score = calculate_quality_metrics(img_raw)
         print(f"🔍 DEBUG - Sharpness: {sharpness_score:.2f} | Brightness: {brightness_score:.2f}")
 
@@ -177,27 +240,28 @@ async def predict(file: UploadFile = File(...)):
                 status_code=400,
                 content={"message": "Quality Error: Poor lighting detected. Please retake."}
             )
-        # --------------------------------------
 
         # Prepare image
         img_resized_pil, img_tensor = preprocess_for_model(img_raw)
 
-        # Predict diagnosis
+        # Predict
         preds = model.predict(img_tensor, verbose=0)
         class_idx = int(np.argmax(preds[0]))
         diagnosis = CLASS_NAMES[class_idx]
         confidence_percent = round(float(np.max(preds[0])) * 100, 2)
+        confidence_label = confidence_label_from_prob(confidence_percent)
 
-        # Real Grad-CAM
+        # Grad-CAM
         heatmap = generate_clinical_gradcam(img_tensor, model)
 
-        # Build returned visualization overlay
+        # Overlay
         overlay_bgr = create_gradcam_overlay(img_raw, heatmap, alpha=0.4)
         img_base64 = encode_bgr_to_base64_png(overlay_bgr)
 
         return {
             "diagnosis": diagnosis,
             "confidence": confidence_percent,
+            "confidence_label": confidence_label,
             "heatmap_image": f"data:image/png;base64,{img_base64}",
             "quality_metrics": {
                 "sharpness": round(sharpness_score, 2),
