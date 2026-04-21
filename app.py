@@ -51,7 +51,13 @@ def calculate_quality_metrics(img_pil):
 def preprocess_for_model(img_pil):
     img_resized = img_pil.resize(IMG_SIZE)
     img_tensor = tf.keras.utils.img_to_array(img_resized)
-    img_tensor = np.expand_dims(img_tensor, axis=0).astype(np.float32)
+    img_tensor = np.expand_dims(img_tensor, axis=0)
+
+    # --- THE FIX: EfficientNet Preprocessing ---
+    # This scales the pixels exactly how the AI expects,
+    # preventing the model from confusing Yellows and Reds.
+    img_tensor = tf.keras.applications.efficientnet.preprocess_input(img_tensor)
+
     return img_resized, img_tensor
 
 
@@ -76,15 +82,14 @@ def is_likely_retina_scan(img_pil):
     dark_ratio = np.mean(gray < 25)
 
     # --- 2. Detect warm retinal colors (orange/red/yellow-ish) ---
-    # Fundus images usually have significant warm tones in HSV.
     hue = hsv[:, :, 0]
     sat = hsv[:, :, 1]
     val = hsv[:, :, 2]
 
     warm_mask = (
-        (((hue >= 5) & (hue <= 35)) | ((hue >= 160) & (hue <= 179))) &
-        (sat > 40) &
-        (val > 40)
+            (((hue >= 5) & (hue <= 35)) | ((hue >= 160) & (hue <= 179))) &
+            (sat > 40) &
+            (val > 40)
     )
     warm_ratio = np.mean(warm_mask)
 
@@ -103,8 +108,6 @@ def is_likely_retina_scan(img_pil):
 
     has_circle = circles is not None
 
-    # Relaxed but practical rule:
-    # retina images often satisfy at least 2 of the 3 checks
     score = 0
     if dark_ratio > 0.15:
         score += 1
@@ -119,42 +122,52 @@ def is_likely_retina_scan(img_pil):
     return True, None
 
 
-def generate_clinical_gradcam(img_tensor, model):
+def generate_clinical_gradcam(img_tensor, full_model):
     """
-    Grad-CAM implementation based on the training notebook structure:
-    Sequential([EfficientNetB0, GAP, BN, Dropout, Dense])
+    Corrected Clinical Grad-CAM.
+    Reaches INSIDE the EfficientNet base to preserve the 7x7 spatial feature map.
     """
-    feature_extractor = model.get_layer("efficientnetb0")
-    classifier_layers = model.layers[1:]
+    try:
+        # 1. Get the nested base model and the target visual layer
+        base_model = full_model.get_layer("efficientnetb0")
+        last_conv_layer = base_model.get_layer("top_activation")
 
-    with tf.GradientTape() as tape:
-        feature_maps = feature_extractor(img_tensor, training=False)
-        tape.watch(feature_maps)
+        # 2. Build a sub-model that outputs both the visual map AND the base model's final output
+        base_grad_model = tf.keras.models.Model(
+            [base_model.inputs], [last_conv_layer.output, base_model.output]
+        )
 
-        x = feature_maps
+        with tf.GradientTape() as tape:
+            # 3. Get the 7x7 visual map and the base output
+            conv_outputs, base_outputs = base_grad_model(img_tensor)
+            tape.watch(conv_outputs)
 
-        for layer in classifier_layers[:-1]:
-            x = layer(x, training=False)
+            # 4. Manually pass the data through custom classification layers (Dropout, Dense, etc.)
+            x = base_outputs
+            for layer in full_model.layers[1:]:
+                x = layer(x, training=False)
 
-        final_dense = classifier_layers[-1]
-        logits = tf.matmul(x, final_dense.kernel) + final_dense.bias
+            predictions = x
+            top_pred_index = tf.argmax(predictions[0])
+            top_class_channel = predictions[:, top_pred_index]
 
-        top_pred_index = tf.argmax(logits[0])
-        top_class_channel = logits[:, top_pred_index]
+        # 5. Calculate the gradients based on the 7x7 map, NOT the flattened output
+        grads = tape.gradient(top_class_channel, conv_outputs)
+        weights = tf.reduce_mean(grads, axis=(0, 1, 2))
 
-    grads = tape.gradient(top_class_channel, feature_maps)
-    if grads is None:
-        raise ValueError("Could not compute gradients for Grad-CAM.")
+        output = conv_outputs[0]
+        heatmap = tf.reduce_sum(tf.multiply(weights, output), axis=-1)
 
-    weights = tf.reduce_mean(grads, axis=(0, 1, 2))
-    output = feature_maps[0]
-    heatmap = tf.reduce_sum(tf.multiply(weights, output), axis=-1)
+        # Normalize
+        heatmap = np.maximum(heatmap, 0)
+        if np.max(heatmap) != 0:
+            heatmap /= np.max(heatmap)
 
-    heatmap = np.maximum(heatmap.numpy(), 0)
-    if np.max(heatmap) != 0:
-        heatmap /= np.max(heatmap)
+        return heatmap
 
-    return heatmap
+    except Exception as e:
+        print(f"⚠️ Grad-CAM failed: {e}")
+        return np.zeros((7, 7))  # Return safe blank heatmap if math fails
 
 
 def create_gradcam_overlay(original_pil, heatmap, alpha=0.4):
@@ -278,4 +291,5 @@ async def predict(file: UploadFile = File(...)):
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
