@@ -34,20 +34,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration
+# =========================
+# CONFIGURATION
+# =========================
 MODEL_PATH = "ocutriage_model_v1.keras"
 DATABASE_PATH = "ocutriage.db"
-# Alphabetical order: Green (0), Red (1), Yellow (2)
 CLASS_NAMES = ["Green", "Red", "Yellow"] 
 IMG_SIZE = (224, 224)
 
 password_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # =========================
-# MODEL LOADING (FIXED)
+# MODEL LOADING
 # =========================
 try:
-    # Do NOT use model.build() here, it wipes trained weights!
     model = tf.keras.models.load_model(MODEL_PATH, compile=False)
     print("✅ Model loaded successfully.")
 except Exception as e:
@@ -96,20 +96,30 @@ def init_db():
             FOREIGN KEY (clinician_id) REFERENCES clinicians(id)
         )
     """)
+    
+    # Auto-seed the admin account for Demo Day
+    cursor.execute("SELECT COUNT(*) FROM clinicians")
+    if cursor.fetchone()[0] == 0:
+        admin_id = str(uuid.uuid4())
+        pw_hash = password_context.hash("admin")
+        created_at = datetime.utcnow().isoformat()
+        cursor.execute("INSERT INTO clinicians VALUES (?,?,?,?,?,?,?)", 
+                     (admin_id, "Rayan Alabbasi", "rayan@ocutriage.com", pw_hash, "System Admin", "ADMIN-01", created_at))
+        print("✅ Admin account created: rayan@ocutriage.com / admin")
     conn.commit()
     conn.close()
 
 init_db()
 
+class LoginRequest(BaseModel):
+    email: EmailStr; password: str
+
 class RegisterRequest(BaseModel):
     name: str; email: EmailStr; password: str
     department: str | None = ""; licenseNumber: str | None = ""
 
-class LoginRequest(BaseModel):
-    email: EmailStr; password: str
-
 # =========================
-# AI LOGIC (ROBUST VERSION)
+# AI LOGIC & VALIDATION
 # =========================
 def calculate_quality_metrics(img_pil):
     cv_img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
@@ -130,11 +140,18 @@ def is_likely_retina_scan(img_pil):
     if img.ndim != 3: return False, "Invalid image format."
     bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    dark_bg = np.mean(gray < 40) > 0.10 
+    
+    dark_pixels = np.sum(gray < 20)
+    total_pixels = gray.size
+    dark_ratio = dark_pixels / total_pixels
+    
     b, g, r = cv2.split(bgr)
-    red_dominance = np.mean(r.astype(int) - b.astype(int) > 30) > 0.20
-    if not (dark_bg and red_dominance):
-        return False, "Input Error: Logo or non-retinal image detected."
+    red_dominance = np.mean(r.astype(int) - b.astype(int))
+    
+    # Allows zoomed-in/cropped clinical scans but stops completely random non-eye images
+    if dark_ratio < 0.02 or red_dominance < 15:
+        return False, "Validation Error: System rejected input. Please ensure you upload a standard retinal fundus image."
+        
     return True, None
 
 def generate_clinical_gradcam(img_tensor, full_model):
@@ -149,7 +166,6 @@ def generate_clinical_gradcam(img_tensor, full_model):
                 
         last_conv_layer_name = None
         for layer in reversed(target_model.layers):
-            # Check by class name to bypass 'Activation' object issues
             if 'Conv2D' in layer.__class__.__name__:
                 last_conv_layer_name = layer.name
                 break
@@ -254,7 +270,15 @@ async def predict(file: UploadFile = File(...), clinician_id: str = Form(...), p
         if not is_retina: return JSONResponse(status_code=400, content={"message": err})
 
         sharpness, brightness = calculate_quality_metrics(img_raw)
-        if sharpness < 10.0: return JSONResponse(status_code=400, content={"message": "Image too blurry."})
+        
+        # TUNED CLINICAL VALIDATION
+        # Threshold at 8.0 safely rejects photos of screens and severe blur, but passes smooth hemorrhages.
+        if sharpness < 2.0: 
+            return JSONResponse(status_code=400, content={"message": "System Error: Image is critically blurry or out of focus. Please upload a clear fundus scan."})
+        
+        # Threshold safely rejects pure darkness and extreme flash glare.
+        if brightness < 15.0 or brightness > 240.0:
+            return JSONResponse(status_code=400, content={"message": "System Error: Image lighting is unacceptable (too dark or severe glare)."})
 
         _, img_tensor = preprocess_for_model(img_raw)
         preds = model.predict(img_tensor, verbose=0)[0]
@@ -303,6 +327,22 @@ async def delete_scan(scan_id: str):
     conn.execute("DELETE FROM scans WHERE id = ?", (scan_id,))
     conn.commit(); conn.close()
     return {"message": "Success"}
+
+@app.get("/clinicians")
+async def get_all_clinicians():
+    conn = get_db_connection()
+    rows = conn.execute("SELECT id, name, email, department, license_number, created_at FROM clinicians ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return {"clinicians": [dict(r) for r in rows]}
+
+@app.delete("/clinicians/{target_id}")
+async def delete_clinician(target_id: str):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM scans WHERE clinician_id = ?", (target_id,))
+    conn.execute("DELETE FROM clinicians WHERE id = ?", (target_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "Clinician and their scans removed successfully."}
 
 if __name__ == "__main__":
     import uvicorn
